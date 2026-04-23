@@ -28,3 +28,11 @@ curl -sS -H "X-PMCC-Token: $TOKEN" http://localhost:8765/spot/SPY | python3 -m j
 echo
 echo "  /spot/AAPL:"
 curl -sS -H "X-PMCC-Token: $TOKEN" http://localhost:8765/spot/AAPL | python3 -m json.tool
+
+echo
+echo "  /account:"
+curl -sS -H "X-PMCC-Token: $TOKEN" http://localhost:8765/account | python3 -m json.tool
+
+echo
+echo "  /positions:"
+curl -sS -H "X-PMCC-Token: $TOKEN" http://localhost:8765/positions | python3 -m json.tool

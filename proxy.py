@@ -265,43 +265,90 @@ async def chain(
 
 
 # ---------------------------------------------------- Portfolio
+def _f(x, default=0.0):
+    """Safe float conversion."""
+    try:
+        if x is None:
+            return default
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
 @app.get("/positions", dependencies=[Depends(require_token)])
 async def positions():
     await gateway.ensure_connected()
-    pos = gateway.ib.positions()
-    return [
-        {
+    # Use reqPositionsAsync to avoid "event loop is already running" error
+    # under uvicorn/uvloop. The sync gateway.ib.positions() calls
+    # loop.run_until_complete on the already-running event loop.
+    try:
+        pos = await gateway.ib.reqPositionsAsync()
+    except AttributeError:
+        # Fallback: positions() is cache-only and doesn't hit the event loop
+        # when positions are already subscribed.
+        pos = gateway.ib.positions()
+
+    # Also fetch portfolio items for market price / unrealized P/L (per-account)
+    portfolio_by_conid: dict[int, Any] = {}
+    try:
+        accounts = gateway.ib.managedAccounts()
+        for acct_code in accounts:
+            for item in gateway.ib.portfolio(acct_code):
+                portfolio_by_conid[item.contract.conId] = item
+    except Exception as e:
+        log.warning(f"portfolio() lookup failed: {e}")
+
+    rows = []
+    for p in pos:
+        pf = portfolio_by_conid.get(p.contract.conId)
+        rows.append({
             "account": p.account,
             "symbol": p.contract.symbol,
             "sec_type": p.contract.secType,
-            "right": getattr(p.contract, "right", None),
-            "strike": getattr(p.contract, "strike", None),
-            "expiry": getattr(p.contract, "lastTradeDateOrContractMonth", None),
-            "position": float(p.position),
-            "avg_cost": float(p.avgCost),
-        }
-        for p in pos
-    ]
+            "right": getattr(p.contract, "right", None) or None,
+            "strike": _f(getattr(p.contract, "strike", None)) or None,
+            "expiry": getattr(p.contract, "lastTradeDateOrContractMonth", None) or None,
+            "position": _f(p.position),
+            "avg_cost": _f(p.avgCost),
+            "market_price": _f(getattr(pf, "marketPrice", 0)) if pf else 0.0,
+            "market_value": _f(getattr(pf, "marketValue", 0)) if pf else 0.0,
+            "unrealized_pnl": _f(getattr(pf, "unrealizedPNL", 0)) if pf else 0.0,
+        })
+    return {"positions": rows}
 
 
 @app.get("/account", dependencies=[Depends(require_token)])
 async def account():
     await gateway.ensure_connected()
-    summary = gateway.ib.accountSummary()
-    return [
-        {
-            "account": s.account,
-            "tag": s.tag,
-            "value": s.value,
-            "currency": s.currency,
-        }
-        for s in summary
-        if s.tag
-        in {
-            "NetLiquidation",
-            "TotalCashValue",
-            "BuyingPower",
-            "AvailableFunds",
-            "GrossPositionValue",
-        }
-    ]
+    # Use accountSummaryAsync to avoid "event loop is already running"
+    try:
+        summary = await gateway.ib.accountSummaryAsync()
+    except AttributeError:
+        # Older ib_insync versions — fall back to reqAccountSummaryAsync
+        try:
+            summary = await gateway.ib.reqAccountSummaryAsync()
+        except AttributeError:
+            summary = gateway.ib.accountSummary()
+
+    def pick(tag: str) -> float:
+        for s in summary:
+            if s.tag == tag:
+                return _f(s.value)
+        return 0.0
+
+    return {
+        "net_liquidation": pick("NetLiquidation"),
+        "buying_power": pick("BuyingPower"),
+        "total_cash": pick("TotalCashValue"),
+        "available_funds": pick("AvailableFunds"),
+        "gross_position_value": pick("GrossPositionValue"),
+        "realized_pnl": pick("RealizedPnL"),
+        "unrealized_pnl": pick("UnrealizedPnL"),
+        "raw": [
+            {"account": s.account, "tag": s.tag, "value": s.value, "currency": s.currency}
+            for s in summary
+        ],
+    }
