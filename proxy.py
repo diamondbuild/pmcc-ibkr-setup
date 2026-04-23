@@ -40,9 +40,19 @@ class GatewayClient:
     def __init__(self):
         self.ib = IB()
         self._connecting = False
+        self._market_data_type_set = False
 
     async def ensure_connected(self) -> None:
         if self.ib.isConnected():
+            # Make sure delayed-frozen mode is enabled even on warm connections
+            if not self._market_data_type_set:
+                try:
+                    # 3 = DELAYED, 4 = DELAYED_FROZEN. Use 4 so we always get last
+                    # known price even after hours / without a live subscription.
+                    self.ib.reqMarketDataType(4)
+                    self._market_data_type_set = True
+                except Exception as e:
+                    log.warning(f"reqMarketDataType failed: {e}")
             return
         if self._connecting:
             # Another request is mid-connect; wait a bit
@@ -99,6 +109,37 @@ async def health():
     }
 
 
+def _clean(x):
+    """Convert NaN/Inf to None so JSON serialization doesn't crash."""
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(xf) or math.isinf(xf):
+        return None
+    return xf
+
+
+def _pick_price(ticker):
+    """Pick the best non-NaN price from a ticker (incl. delayed fields)."""
+    # Live fields first, then delayed (prefixed), then close
+    candidates = [
+        getattr(ticker, "last", None),
+        getattr(ticker, "marketPrice", lambda: None)() if callable(getattr(ticker, "marketPrice", None)) else None,
+        getattr(ticker, "delayedLast", None),
+        getattr(ticker, "close", None),
+        getattr(ticker, "delayedClose", None),
+        # Mid of bid/ask as last resort
+        ((ticker.bid + ticker.ask) / 2) if getattr(ticker, "bid", None) and getattr(ticker, "ask", None) else None,
+        ((getattr(ticker, "delayedBid", 0) or 0) + (getattr(ticker, "delayedAsk", 0) or 0)) / 2 or None,
+    ]
+    for c in candidates:
+        v = _clean(c)
+        if v is not None and v > 0:
+            return v
+    return None
+
+
 # ---------------------------------------------------- Spot price
 @app.get("/spot/{symbol}", dependencies=[Depends(require_token)])
 async def spot(symbol: str):
@@ -106,14 +147,22 @@ async def spot(symbol: str):
     contract = Stock(symbol.upper(), "SMART", "USD")
     await gateway.ib.qualifyContractsAsync(contract)
     ticker = gateway.ib.reqMktData(contract, "", False, False)
-    # Give IBKR a moment to populate
-    for _ in range(20):
+    # Give IBKR a moment to populate (delayed data can take 2-3s to arrive)
+    price = None
+    for _ in range(40):
         await asyncio.sleep(0.1)
-        if ticker.last or ticker.close or ticker.marketPrice():
+        price = _pick_price(ticker)
+        if price:
             break
-    price = ticker.last or ticker.close or ticker.marketPrice()
     gateway.ib.cancelMktData(contract)
-    return {"symbol": symbol.upper(), "price": float(price) if price else None}
+    return {
+        "symbol": symbol.upper(),
+        "price": price,
+        "bid": _clean(getattr(ticker, "bid", None)) or _clean(getattr(ticker, "delayedBid", None)),
+        "ask": _clean(getattr(ticker, "ask", None)) or _clean(getattr(ticker, "delayedAsk", None)),
+        "close": _clean(getattr(ticker, "close", None)) or _clean(getattr(ticker, "delayedClose", None)),
+        "delayed": price is not None and not _clean(getattr(ticker, "last", None)),
+    }
 
 
 # ---------------------------------------------------- Options chain
