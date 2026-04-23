@@ -161,3 +161,4 @@ echo "--- Proxy health ---"
 curl -sS http://localhost:8765/health | python3 -m json.tool || true
 echo
 echo "Done. If gateway_connected is still false, paste the output above."
+# cache bust 1776913734
